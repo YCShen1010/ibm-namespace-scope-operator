@@ -83,8 +83,16 @@ rules:
     apiGroups:
       - apps
     resources:
-      - daemonsets
       - statefulsets
+  {{- if $.Values.podRefresh.grantDaemonSetRBAC }}
+  - verbs:
+      - get
+      - patch
+    apiGroups:
+      - apps
+    resources:
+      - daemonsets
+  {{- end }}
   - verbs:
       - get
       - list

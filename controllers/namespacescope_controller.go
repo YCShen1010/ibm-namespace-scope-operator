@@ -64,10 +64,55 @@ import (
 type NamespaceScopeReconciler struct {
 	client.Reader
 	client.Client
-	Recorder  record.EventRecorder
-	Scheme    *runtime.Scheme
-	Config    *rest.Config
-	hasOLMAPI bool
+	Recorder                   record.EventRecorder
+	Scheme                     *runtime.Scheme
+	Config                     *rest.Config
+	hasOLMAPI                  bool
+	daemonSetPermissionChecker daemonSetPermissionChecker
+}
+
+type daemonSetPermissionChecker interface {
+	Check(ctx context.Context, namespace string) (daemonSetAccessResult, error)
+}
+
+type daemonSetAccessResult struct {
+	allowed    bool
+	deniedVerb string
+}
+
+type selfSubjectDaemonSetPermissionChecker struct {
+	client client.Client
+}
+
+func (c selfSubjectDaemonSetPermissionChecker) Check(ctx context.Context, namespace string) (daemonSetAccessResult, error) {
+	for _, verb := range []string{"get", "patch"} {
+		review := &authorizationv1.SelfSubjectAccessReview{
+			Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+				ResourceAttributes: &authorizationv1.ResourceAttributes{
+					Group:     "apps",
+					Resource:  "daemonsets",
+					Namespace: namespace,
+					Verb:      verb,
+				},
+			},
+		}
+		if err := c.client.Create(ctx, review); err != nil {
+			return daemonSetAccessResult{}, err
+		}
+		if review.Status.EvaluationError != "" {
+			return daemonSetAccessResult{}, fmt.Errorf(
+				"failed to evaluate %q permission for daemonsets in namespace %q: %s",
+				verb,
+				namespace,
+				review.Status.EvaluationError,
+			)
+		}
+		if !review.Status.Allowed {
+			return daemonSetAccessResult{deniedVerb: verb}, nil
+		}
+	}
+
+	return daemonSetAccessResult{allowed: true}, nil
 }
 
 func (r *NamespaceScopeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -937,20 +982,51 @@ func (r *NamespaceScopeReconciler) RestartPods(ctx context.Context, labels map[s
 
 	// Refresh pods from daemonSet
 	daemonSetNameList = util.ToStringSlice(util.MakeSet(daemonSetNameList))
-	for _, daemonSetName := range daemonSetNameList {
-		daemonSet := &appsv1.DaemonSet{}
-		if err := r.Client.Get(ctx, types.NamespacedName{Name: daemonSetName, Namespace: namespace}, daemonSet); err != nil {
-			klog.Errorf("Failed to get daemonSet %s in namespace %s: %v", daemonSetName, namespace, err)
-			return err
+	manageDaemonSets := len(daemonSetNameList) > 0
+	if manageDaemonSets {
+		checker := r.daemonSetPermissionChecker
+		if checker == nil {
+			checker = selfSubjectDaemonSetPermissionChecker{client: r.Client}
 		}
-		originalDaemonSet := daemonSet
-		if daemonSet.Spec.Template.Annotations == nil {
-			daemonSet.Spec.Template.Annotations = make(map[string]string)
+
+		access, err := checker.Check(ctx, namespace)
+		if err != nil {
+			if errors.IsForbidden(err) || errors.IsUnauthorized(err) {
+				klog.Warningf("Unable to review DaemonSet permissions in namespace %q; skipping DaemonSet pod refresh: %v", namespace, err)
+				manageDaemonSets = false
+			} else {
+				return fmt.Errorf("error reviewing daemonset permissions in namespace %q: %w", namespace, err)
+			}
+		} else if !access.allowed {
+			klog.Warningf("DaemonSet pod refresh is not permitted in namespace %q (missing %q permission); skipping DaemonSet management", namespace, access.deniedVerb)
+			manageDaemonSets = false
 		}
-		daemonSet.Spec.Template.Annotations["nss.ibm.com/namespaceList"] = annotationValue
-		if err := r.Client.Patch(ctx, daemonSet, client.MergeFrom(originalDaemonSet)); err != nil {
-			klog.Errorf("Failed to update the annotation of the daemonSet %s in namespace %s: %v", daemonSetName, namespace, err)
-			return err
+	}
+
+	if manageDaemonSets {
+		for _, daemonSetName := range daemonSetNameList {
+			daemonSet := &appsv1.DaemonSet{}
+			if err := r.Client.Get(ctx, types.NamespacedName{Name: daemonSetName, Namespace: namespace}, daemonSet); err != nil {
+				if errors.IsForbidden(err) {
+					klog.Warningf("DaemonSet get is forbidden in namespace %q after a successful access review; skipping remaining DaemonSet pod refresh: %v", namespace, err)
+					break
+				}
+				klog.Errorf("Failed to get daemonSet %s in namespace %s: %v", daemonSetName, namespace, err)
+				return err
+			}
+			originalDaemonSet := daemonSet.DeepCopy()
+			if daemonSet.Spec.Template.Annotations == nil {
+				daemonSet.Spec.Template.Annotations = make(map[string]string)
+			}
+			daemonSet.Spec.Template.Annotations["nss.ibm.com/namespaceList"] = annotationValue
+			if err := r.Client.Patch(ctx, daemonSet, client.MergeFrom(originalDaemonSet)); err != nil {
+				if errors.IsForbidden(err) {
+					klog.Warningf("DaemonSet patch is forbidden in namespace %q after a successful access review; skipping remaining DaemonSet pod refresh: %v", namespace, err)
+					break
+				}
+				klog.Errorf("Failed to update the annotation of the daemonSet %s in namespace %s: %v", daemonSetName, namespace, err)
+				return err
+			}
 		}
 	}
 

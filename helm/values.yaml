@@ -11,3 +11,8 @@ cpfs:
   allowSubsetProjection: false
   configmapName: namespace-scope
   labels:
+
+# Controls whether this Helm chart grants DaemonSet RBAC. When false, the
+# controller can still manage DaemonSets if permission is granted elsewhere.
+podRefresh:
+  grantDaemonSetRBAC: true
